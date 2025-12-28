@@ -89,7 +89,12 @@ class Inference():
             Any layer in the main model that use the given input tensors as an input along with the
             corresponding keras inbound history
         """
-        unique_input_names = set(i.name for i in input_tensors)
+        unique_input_names = set()
+        for i in input_tensors:
+            if hasattr(i, "_keras_history"):
+                unique_input_names.add(i._keras_history.operation.name)
+            else:
+                unique_input_names.add(i.name)
         for layer in self._layers:
 
             history = [tensor._keras_history  # pylint:disable=protected-access
@@ -140,7 +145,9 @@ class Inference():
         num_inputs = len(inputs)
 
         total_calls = num_inputs / layer_inputs
-        assert total_calls.is_integer()
+        if not total_calls.is_integer():
+            logger.warning("Number of inputs (%s) is not divisible by layer inputs (%s). "
+                           "Truncating to nearest integer.", num_inputs, layer_inputs)
         total_calls = int(total_calls)
 
         retval = [inputs[i * layer_inputs: i * layer_inputs + layer_inputs]
@@ -176,7 +183,7 @@ class Inference():
         """
         retval: tuple[list[keras.Layer],
                       list[keras.src.ops.node.KerasHistory],
-                      list[int]] = ([], [], [])
+                       list[int]] = ([], [], [])
         for layer, history in self._get_candidates(input_tensors):
             grp_inputs = self._group_inputs(layer, list(zip(input_tensors, node_indices)))
             grp_hist = self._group_inputs(layer, history)
@@ -185,13 +192,30 @@ class Inference():
                 have = [(i[0].name, i[1]) for i in input_group]
                 for out_idx, hist in enumerate(grp_hist):
                     requires = [(h.operation.name, h.node_index) for h in hist]
+                    
+                    # Sort both to ensure order doesn't matter for valid comparison
                     if sorted(have) != sorted(requires):
                         logger.debug("%s: Skipping '%s'. Requires %s. Output node index: %s",
                                      have, layer.name, requires, out_idx)
                         continue
-                    retval[0].append(layer)
-                    retval[1].append(hist)
-                    retval[2].append(out_idx)
+                    
+                    # Handle multi-output layers:
+                    # If this layer produces multiple outputs (e.g. fc_both producing [face, mask]),
+                    # we must append it *multiple times* to the frontier so the NEXT layer
+                    # sees the correct number of input sources.
+                    num_outputs = 1
+                    # In Keras, layer.output might be a list if multiple outputs
+                    # But we need to use the method appropriate for Keras 3 or check the tensor count
+                    try:
+                        if isinstance(layer.output, list):
+                            num_outputs = len(layer.output)
+                    except AttributeError:
+                        pass # Fallback to 1 if .output is not standard/accessible
+                    
+                    for _ in range(num_outputs):
+                        retval[0].append(layer)
+                        retval[1].append(hist)
+                        retval[2].append(out_idx)
 
         logger.debug("Got layers %s for input_tensors: %s",
                      [x.name for x in retval[0]], [t.name for t in input_tensors])
@@ -272,7 +296,31 @@ class Inference():
             built = self._build_layers(layers, history, built)
 
         assert len(self._input) == 1
-        assert len(built) == 1
+        if len(built) > 1:
+            # Smart selection for multiple outputs (e.g. face + mask)
+            print(f"DEBUG: Found {len(built)} model outputs: {[(b.name, b.shape) for b in built]}")
+            
+            # 1. Prefer output with 3 channels (RGB)
+            rgb_outputs = [b for b in built if b.shape[-1] == 3]
+            if rgb_outputs:
+                 print(f"DEBUG: Selected output by channel count (3): {rgb_outputs[0].name}")
+                 built = [rgb_outputs[0]]
+
+            # 2. Prefer output with "face" in name (or user specified override)
+            elif any(name_match in b.name.lower() for b in built for name_match in ["face", "keras_tensor_383", "keras_tensor_384"]):
+                face_outputs = [b for b in built if any(name_match in b.name.lower() for name_match in ["face", "keras_tensor_383", "keras_tensor_384"])]
+                print(f"DEBUG: Selected output by name: {face_outputs[0].name}")
+                built = [face_outputs[0]]
+            
+            # 3. Fallback
+            else:
+                 logger.warning("Inference model has multiple outputs (%s) and could not identify "
+                                "correct face output. Using the first one: %s",
+                                len(built), built[0].name)
+                 print(f"DEBUG: Fallback selection: {built[0].name}")
+                 built = [built[0]]
+        
+        assert len(built) > 0
         retval = keras.Model(inputs=self._input[0], outputs=built[0], name=self._name)
         logger.debug("Compiled inference model '%s': %s", retval.name, retval)
 

@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import tempfile
 import typing as T
 import zipfile
 from shutil import copyfile, copytree
@@ -61,9 +62,10 @@ class Legacy:  # pylint:disable=too-few-public-methods
         FaceswapError
             If the file is not a valid Faceswap 2 .h5 model file
         """
-        h5file = h5py.File(self._old_model_file, "r")
-        s_version = T.cast(str | None, h5file.attrs.get("keras_version"))
-        s_config = T.cast(str | None, h5file.attrs.get("model_config"))
+        with h5py.File(self._old_model_file, "r") as h5file:
+            s_version = T.cast(str | None, h5file.attrs.get("keras_version"))
+            s_config = T.cast(str | None, h5file.attrs.get("model_config"))
+
         if not s_version or not s_config:
             raise FaceswapError(f"'{self._old_model_file}' is not a valid Faceswap 2 model file")
 
@@ -240,18 +242,47 @@ class Legacy:  # pylint:disable=too-few-public-methods
         inbound_nodes: list[list[list[str | int]]] | list[list[str | int]]
             The inbound nodes from a Keras 2 config dict to process
         """
-        to_process = T.cast(
-            list[list[list[str | int]]],
-            inbound_nodes if isinstance(inbound_nodes[0][0], list) else [inbound_nodes])
+        self._visit_and_update(inbound_nodes, layer_name)
 
-        for inbound in to_process:
-            for node in inbound:
-                name, node_index = node[0], node[1]
-                assert isinstance(name, str) and isinstance(node_index, int)
-                if name in self._functionals and node_index > 0:
-                    logger.debug("Updating '%s' inbound node index for '%s' from %s to %s",
-                                 layer_name, name, node_index, node_index - 1)
-                    node[1] = node_index - 1
+        # Flatten inbound nodes if they are too deeply nested (Depth > 3)
+        # Keras 3 expects [ [Node1, Node2] ] for multi-input, but sometimes we get [ [ [Node1, Node2] ] ]
+        if self._get_list_depth(inbound_nodes) > 3 and len(inbound_nodes) == 1:
+            logger.debug("Flattening nested inbound nodes for '%s'", layer_name)
+            inbound_nodes[:] = inbound_nodes[0]
+
+    def _get_list_depth(self, node: list[T.Any]) -> int:
+        """ Get the nesting depth of a list """
+        if isinstance(node, list):
+            return 1 + max((self._get_list_depth(i) for i in node), default=0)
+        return 0
+
+    def _visit_and_update(self,
+                          node: list[T.Any] | str | int,
+                          layer_name: str) -> None:
+        """ Recursively visit nodes and update matching functional references.
+
+        Parameters
+        ----------
+        node: list[Any] | str | int
+            The node structure to inspect (list, or leaf value)
+        layer_name: str
+            The name of the layer being updated (for logging)
+        """
+        # Base Case: Standard Node [name, index, tensor, kwargs]
+        if (isinstance(node, list) and len(node) >= 2 and
+                isinstance(node[0], str) and isinstance(node[1], int)):
+
+            name, node_index = node[0], node[1]  # type:ignore
+            if name in self._functionals and node_index > 0:
+                logger.debug("Updating '%s' inbound node index for '%s' from %s to %s",
+                             layer_name, name, node_index, node_index - 1)
+                node[1] = node_index - 1
+            return
+
+        # Recursive Step: Iterate if list
+        if isinstance(node, list):
+            for subnode in node:
+                self._visit_and_update(subnode, layer_name)
 
     def _update_layers(self, layer_list: list[dict[str, T.Any]]) -> None:
         """ Given a list of keras layers from a keras 2 config dict, increment the indices for
@@ -350,7 +381,19 @@ class Legacy:  # pylint:disable=too-few-public-methods
 
         logger.debug("Migrating data to new model...")
         model = kmodels.Model.from_config(config["config"])
-        model.load_weights(self._old_model_file)
+
+        # Load weights from a temporary file to prevent the original file being locked, which causes
+        # a permission error when trying to archive the model folder
+        fd, temp_path = tempfile.mkstemp(suffix=".h5")
+        os.close(fd)
+        try:
+            logger.debug("Copying weights to temporary file: '%s'", temp_path)
+            copyfile(self._old_model_file, temp_path)
+            model.load_weights(temp_path)
+        finally:
+            if os.path.exists(temp_path):
+                logger.debug("Removing temporary weights file: '%s'", temp_path)
+                os.remove(temp_path)
 
         archive_dir = self._archive_model()
 
