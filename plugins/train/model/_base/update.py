@@ -1,12 +1,15 @@
 #! /usr/env/bin/python3
 """ Updating legacy faceswap models to the current version """
+import gc
 import json
 import logging
 import os
 import tempfile
+import time
 import typing as T
 import zipfile
 from shutil import copyfile, copytree
+
 
 import h5py
 import numpy as np
@@ -339,7 +342,17 @@ class Legacy:  # pylint:disable=too-few-public-methods
             os.rmdir(dst_path)
 
         logger.info("Archiving model folder '%s' to '%s'", model_dir, dst_path)
-        os.rename(model_dir, dst_path)
+        for i in range(1, 6):
+            try:
+                os.rename(model_dir, dst_path)
+                break
+            except (OSError, PermissionError) as err:
+                if i == 5:
+                    raise err
+                logger.warning("Error archiving model folder (attempt %s of 5): %s", i, err)
+                gc.collect()
+                time.sleep(2)
+
         return dst_path
 
     def _restore_files(self, archive_dir: str) -> None:
