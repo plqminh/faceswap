@@ -565,7 +565,7 @@ def crash_log() -> str:
     return filename
 
 
-def format_array(array: np.ndarray) -> str:
+def format_array(array: np.ndarray | T.Any) -> str:
     """Format arrays to be suitable for logging
 
     Parameters
@@ -582,13 +582,29 @@ def format_array(array: np.ndarray) -> str:
     except ImportError:
         return repr(array)
 
+    if not isinstance(array, np.ndarray):
+        if isinstance(array, list):
+            return f"[{', '.join(format_array(x) for x in array)}]"
+        if isinstance(array, tuple):
+            return f"({', '.join(format_array(x) for x in array)}{',' if len(array) == 1 else ''})"
+        return repr(array)
+
+    if array.ndim == 0:
+        val = (format_array(array.item())
+               if isinstance(array.item(), np.ndarray)
+               else repr(array.item()))
+        return f"np.array({val}, dtype='{array.dtype}')"
+
     if array.dtype == "object":
-        retval = "np.array("
+        if not array.size:
+            return f"np.array([], dtype='{array.dtype}')"
+        if np.prod(array.shape) > 10:
+            return f"<array(shape{array.shape}, '{array.dtype}')>"
+        retval = "np.array(["
         for sub in array:
             retval += f"{format_array(sub)}, "
-        if array.size:
-            retval = retval[:-2]
-        return f"{retval}, dtype='{array.dtype}')"
+        retval = retval[:-2]
+        return f"{retval}], dtype='{array.dtype}')"
 
     if np.prod(array.shape) <= 10:
         return f"np.array({str(array.tolist())}, dtype='{array.dtype}')"

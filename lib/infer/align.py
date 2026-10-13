@@ -172,9 +172,15 @@ class Align(ExtractHandler):
             img = images[image_id]
             img = img[..., 2::-1] if self.plugin.is_rgb else img
             for i, (box, dst) in enumerate(zip(bboxes, dst)):
+                src_h = box[3] - box[1]
+                src_w = box[2] - box[0]
+                dst_h = dst[3] - dst[1]
+                dst_w = dst[2] - dst[0]
+                if src_h <= 0 or src_w <= 0 or dst_h <= 0 or dst_w <= 0:
+                    continue  # Skip degenerate regions
                 out = batch[batch_id, i]
                 cv2.resize(img[box[1]:box[3], box[0]:box[2]],
-                           (dst[2] - dst[0], dst[3] - dst[1]),
+                           (dst_w, dst_h),
                            dst=out[dst[1]:dst[3], dst[0]:dst[2]],
                            interpolation=interpolations[batch_id, i])
         retval = batch.reshape((-1, self.plugin.input_size, self.plugin.input_size, 3))
@@ -228,9 +234,12 @@ class Align(ExtractHandler):
         assert np.all(roi[:, 3] - roi[:, 1] == roi[:, 2] - roi[:, 0]), (
             f"[{self.plugin.name}.pre_process] All ROI bounding boxes for aligner input must "
             "be square")
+        roi_sizes = roi[:, 2] - roi[:, 0]
+        # Ensure minimum ROI size of 1 pixel to prevent divide-by-zero in scale computation
+        roi_sizes = np.maximum(roi_sizes, 1)
         retval = np.zeros((roi.shape[0], 3, 3), dtype="float32")
-        retval[:, 0, 0] = roi[:, 2] - roi[:, 0]
-        retval[:, 1, 1] = roi[:, 3] - roi[:, 1]
+        retval[:, 0, 0] = roi_sizes
+        retval[:, 1, 1] = roi_sizes
         retval[:, 0, 2] = roi[:, 0]
         retval[:, 1, 2] = roi[:, 1]
         retval[:, 2, 2] = 1.0
@@ -254,6 +263,29 @@ class Align(ExtractHandler):
         if iteration == 1:
             # Re-feeds are performed during 2nd pass on aligned bounding box for re-aligns
             boxes = batch.bboxes.copy()
+
+            # Filter out degenerate (zero-area) bounding boxes that would cause divide-by-zero
+            # in scale computation. These occur when the detector produces a zero-dimension face.
+            widths = boxes[:, 2] - boxes[:, 0]
+            heights = boxes[:, 3] - boxes[:, 1]
+            valid = (widths > 0) & (heights > 0)
+            if not np.all(valid):
+                n_removed = int(np.sum(~valid))
+                logger.debug(
+                    "[%s.pre_process] Removing %s degenerate (zero-area) bounding box(es)",
+                    self.plugin.name, n_removed)
+                boxes = boxes[valid]
+                batch.bboxes = batch.bboxes[valid]
+                batch.frame_ids = batch.frame_ids[valid]
+
+            if boxes.shape[0] == 0:
+                logger.debug("[%s.pre_process] No valid bounding boxes remaining after filtering",
+                             self.plugin.name)
+                batch.matrices = np.empty((0, 3, 3), dtype="float32")
+                batch.data = np.empty(
+                    (0, self.plugin.input_size, self.plugin.input_size, 3), dtype="float32")
+                return
+
             roi = self.plugin.pre_process(boxes)
             mats = self._matrices_from_roi(roi)
             if is_final and self._re_feed.total_feeds > 1:

@@ -598,7 +598,13 @@ class OptimizerMigrate:
         if not compile_conf:
             logger.debug("[OptimizerMigrate] No saved keras optimizer in model file")
             return None
-        tmp_model = T.cast(k_models.Model, k_models.load_model(self._model_path, compile=True))
+        try:
+            tmp_model = T.cast(k_models.Model,
+                               k_models.load_model(self._model_path, compile=True))
+        except TypeError as e:
+            logger.warning("Could not load compiled model for optimizer migration "
+                           "(likely removed custom class: %s). Optimizer will be reset.", e)
+            return None
         opt = T.cast("K_Optimizer", tmp_model.optimizer)
         group_ids = get_parameter_group_ids(tmp_model.trainable_variables)
         del tmp_model

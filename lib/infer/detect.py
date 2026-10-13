@@ -178,8 +178,9 @@ class Detect(ExtractHandler):
         indices_requires = np.flatnonzero(mask_requires)
         indices_angle[indices_requires[mask_found]] = rotation_index
         mask_requires[indices_requires[mask_found]] = False
-        for i, box in zip(indices_requires[mask_found], bboxes):
-            box_list[i] = box
+        for i, found, box in zip(indices_requires, mask_found, bboxes):
+            if found:
+                box_list[i] = box
 
     def process(self, batch: ExtractBatch) -> None:
         """Obtain the output from the plugin's model.
@@ -235,9 +236,9 @@ class Detect(ExtractHandler):
                 break
             idx += 1
 
-        boxes = (np.array([self._empty_bbox if b is None else b for b in box_list],
-                          dtype="object")
-                 if boxes is None else boxes)
+        if boxes is None:
+            boxes = np.empty(batch_size, dtype=object)
+            boxes[:] = [self._empty_bbox if b is None else b for b in box_list]
         batch.data = np.empty(2, dtype="object")
         batch.data[0] = indices_angle
         batch.data[1] = boxes
@@ -385,7 +386,7 @@ class Rotator:
         logger.debug(parse_class_init(locals()))
         self._size = image_size
         self._angles = self._get_angles(angles)
-        self._matrices = batch_create_matrices(self._size, rotation=self._angles)
+        self._matrices = batch_create_matrices(self._size, rotation=self._angles)[:, :2]
         self._matrices_inverse = self._pre_compute_inverse_matrices()
         self._channels_first: bool | None = None
         self.enabled = len(self._angles) > 1
